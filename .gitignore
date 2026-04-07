@@ -1,0 +1,49 @@
+.venv/
+video/
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Output / debug
+outputs/
+runs/
+result/
+tmp/
+
+# Video / model / data lớn
+video/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pt
+*.onnx
+*.engine
+*.xml
+*.bin
+
+# ByteTrack / Ultralytics cache
+trackers/
+*.cache
+
+# Local config nếu bạn không muốn push ROI riêng
+config/roi_config.json
