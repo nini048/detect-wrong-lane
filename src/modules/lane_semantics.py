@@ -62,7 +62,7 @@ class LaneSemanticsInferer:
             templates.append(
                 (
                     "mixed_motor_vehicle",
-                    ["car", "truck", "bus"],
+                    ["car", "truck", "bus","motorbike"],
                     "Middle lane. Treat as mixed motor-vehicle lane.",
                 )
             )
