@@ -6,10 +6,21 @@ import cv2
 import numpy as np
 import scipy.signal
 
+
 class LaneDetector:
     """
-    Lane detector for fixed CCTV cameras - v3.15 (OFFSET THỰC TẾ CHO L1)
+    Lane detector for fixed CCTV cameras - v3.16
+    Changelog v3.16:
+      - FIX 1: Bỏ hard-cap [:3] trên chosen_boundaries khi LOCKED — không còn xóa boundary của L1
+      - FIX 2: outer_boundary dùng poly_degree nhất quán (3 coeffs) thay vì bậc 1 (2 coeffs)
+      - FIX 3: edge_penalty trong _select_best_subset nới lỏng từ 0.12/0.88 → 0.06/0.94
+               để boundary gần cạnh BEV (L1) không bị loại khi calibration
+      - FIX 4: _vehicle_partition_boundaries bỏ hard-cap [:3] — nhất quán với detect()
+      - FIX 5: get_vehicle_lane() sửa dead-code if/else trả về cùng idx+1
+      - FIX 6: histogram EMA giảm alpha 0.82→0.72, tăng trọng current 0.18→0.28
+               để peak L1 bị che khuất hồi phục nhanh hơn
     """
+
     def __init__(
         self,
         roi_points: List[List[float]],
@@ -55,8 +66,9 @@ class LaneDetector:
         self.M = cv2.getPerspectiveTransform(self.src_quad, self.dst_quad)
         self.Minv = cv2.getPerspectiveTransform(self.dst_quad, self.src_quad)
 
-        self.left_outer_boundary = np.array([0.0, 0.0, 0.0])
-        self.right_outer_boundary = np.array([0.0, 0.0, 0.0])
+        # FIX 2: khởi tạo outer boundary với poly_degree+1 coeffs (zero-padded)
+        self.left_outer_boundary = np.zeros(self.poly_degree + 1, dtype=np.float64)
+        self.right_outer_boundary = np.zeros(self.poly_degree + 1, dtype=np.float64)
 
         self.frame_index = 0
         self.boundary_tracks: List[Dict[str, object]] = []
@@ -338,11 +350,16 @@ class LaneDetector:
                 score_sum = float(np.sum([float(item["score"]) for item in subset]))
                 coverage = float(np.mean([float(item["coverage_ratio"]) for item in subset]))
                 continuity = float(np.mean([float(item["continuity_ratio"]) for item in subset]))
+
+                # FIX 3: nới lỏng edge_penalty từ 0.12/0.88 → 0.06/0.94
+                # Boundary L1 (lane ngoài cùng) thường nằm gần cạnh BEV,
+                # ngưỡng cũ 0.12/0.88 quá chặt dẫn đến loại nhầm L1.
                 edge_penalty = 0.0
-                if subset_xs[0] < self.bev_w * 0.12:
+                if subset_xs[0] < self.bev_w * 0.06:
                     edge_penalty += 0.35
-                if subset_xs[-1] > self.bev_w * 0.88:
+                if subset_xs[-1] > self.bev_w * 0.94:
                     edge_penalty += 0.35
+
                 target_bonus = 0.0
                 if target_count is not None:
                     if length == target_count:
@@ -361,8 +378,10 @@ class LaneDetector:
         if self.histogram_ema is None:
             self.histogram_ema = histogram_current.copy()
         else:
-            self.histogram_ema = 0.82 * self.histogram_ema + 0.18 * histogram_current
-        histogram = 0.22 * histogram_current + 0.78 * self.histogram_ema
+            # FIX 6: giảm EMA alpha 0.82→0.72, tăng trọng current 0.18→0.28
+            # Để peak của L1 khi bị xe che khuất nhiều frame hồi phục nhanh hơn
+            self.histogram_ema = 0.72 * self.histogram_ema + 0.28 * histogram_current
+        histogram = 0.35 * histogram_current + 0.65 * self.histogram_ema
         if histogram.max() <= 0:
             return [], histogram
         kernel = np.ones(31, dtype=np.float32) / 31.0
@@ -556,22 +575,39 @@ class LaneDetector:
             lane_polygons_orig.append(poly)
         return lines_orig, lane_polygons_orig
 
-    def _build_frozen_result(self, frame: np.ndarray, roi_frame: np.ndarray, bev: np.ndarray) -> Dict[str, object]:
-        chosen_boundaries = self.locked_boundaries_bev
+    def _make_outer_boundary_dict(self, coeffs: np.ndarray) -> Dict[str, object]:
+        """Helper tạo dict cho outer boundary với đầy đủ fields."""
+        return {
+            "coeffs": coeffs,
+            "score": 1.0,
+            "coverage_ratio": 1.0,
+            "continuity_ratio": 1.0,
+            "y_min": 0,
+            "y_max": self.bev_h - 1,
+            "age": 999,
+            "misses": 0,
+        }
 
-        if len(chosen_boundaries) > 3:
-            chosen_boundaries = sorted(chosen_boundaries, key=lambda item: float(np.polyval(item["coeffs"], self.bev_h - 1)))[:3]
+    def _build_frozen_result(self, frame: np.ndarray, roi_frame: np.ndarray, bev: np.ndarray) -> Dict[str, object]:
+        # FIX 1 (frozen path): bỏ hard-cap [:3] — giữ toàn bộ locked boundaries
+        chosen_boundaries = list(self.locked_boundaries_bev)
 
         visual_boundaries = list(chosen_boundaries)
 
         if len(visual_boundaries) >= 2:
-            left_outer = {"coeffs": self.left_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
-            right_outer = {"coeffs": self.right_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
-            visual_boundaries = [left_outer] + visual_boundaries + [right_outer]
+            visual_boundaries = (
+                [self._make_outer_boundary_dict(self.left_outer_boundary)]
+                + visual_boundaries
+                + [self._make_outer_boundary_dict(self.right_outer_boundary)]
+            )
 
         visual_boundaries.sort(key=lambda item: np.polyval(item["coeffs"], self.bev_h - 1))
         boundaries_orig, lane_polygons_orig = self._build_output_boundaries(visual_boundaries)
         detected_boundaries_orig, _ = self._build_output_boundaries(chosen_boundaries)
+
+        n_inner = len(chosen_boundaries)
+        total_boundaries = n_inner + 2  # +2 outer
+        lane_count = max(0, total_boundaries - 1)
 
         result = {
             "mode": "LOCKED",
@@ -588,10 +624,10 @@ class LaneDetector:
             "boundaries": boundaries_orig,
             "detected_boundaries": detected_boundaries_orig,
             "lane_polygons": lane_polygons_orig,
-            "boundary_count": 5,
+            "boundary_count": total_boundaries,
             "visual_boundary_count": len(visual_boundaries),
             "estimated_outer_edges": 2,
-            "lane_count": 4,
+            "lane_count": lane_count,
             "confidence": float(max(self.last_result.get("confidence", 0.0), 0.90)),
             "locked": True,
             "lock_hits": int(self.lock_hits),
@@ -607,12 +643,18 @@ class LaneDetector:
         roi_frame, bev, vehicle_mask_bev = self._warp_to_bev(frame, tracks=tracks)
 
         if self.frame_index == 1:
-            left_pts = np.array([[0, 0], [0, self.bev_h - 1]], dtype=np.float32)
-            right_pts = np.array([[self.bev_w - 1, 0], [self.bev_w - 1, self.bev_h - 1]], dtype=np.float32)
-            left_pts = cv2.perspectiveTransform(left_pts.reshape(-1, 1, 2), self.Minv).reshape(-1, 2)
-            right_pts = cv2.perspectiveTransform(right_pts.reshape(-1, 1, 2), self.Minv).reshape(-1, 2)
-            self.left_outer_boundary = np.polyfit([0, self.bev_h - 1], [left_pts[0][0], left_pts[1][0]], 1)
-            self.right_outer_boundary = np.polyfit([0, self.bev_h - 1], [right_pts[0][0], right_pts[1][0]], 1)
+            # FIX 2: tính outer boundary với poly_degree nhất quán
+            # Lấy nhiều điểm dọc theo cạnh BEV rồi polyfit bậc poly_degree
+            # để coeffs luôn có poly_degree+1 phần tử, tránh mismatch với polyval
+            bev_ys = np.linspace(0, self.bev_h - 1, 20, dtype=np.float32)
+
+            left_bev_pts = np.stack([np.zeros_like(bev_ys), bev_ys], axis=1).astype(np.float32)
+            left_orig_pts = cv2.perspectiveTransform(left_bev_pts.reshape(-1, 1, 2), self.Minv).reshape(-1, 2)
+            self.left_outer_boundary = np.polyfit(bev_ys, left_orig_pts[:, 0], self.poly_degree)
+
+            right_bev_pts = np.stack([np.full_like(bev_ys, self.bev_w - 1), bev_ys], axis=1).astype(np.float32)
+            right_orig_pts = cv2.perspectiveTransform(right_bev_pts.reshape(-1, 1, 2), self.Minv).reshape(-1, 2)
+            self.right_outer_boundary = np.polyfit(bev_ys, right_orig_pts[:, 0], self.poly_degree)
 
         if self.locked and self.last_result and self.locked_update_interval > 1:
             if (self.frame_index % self.locked_update_interval) != 0:
@@ -626,15 +668,19 @@ class LaneDetector:
 
         chosen_boundaries = self.locked_boundaries_bev if self.locked and self.locked_boundaries_bev else detected_boundaries
 
-        if self.locked and len(chosen_boundaries) > 3:
-            chosen_boundaries = sorted(chosen_boundaries, key=lambda item: float(np.polyval(item["coeffs"], self.bev_h - 1)))[:3]
+        # FIX 1 (detect path): bỏ hoàn toàn hard-cap [:3] trên chosen_boundaries.
+        # Trước đây code cắt bỏ boundary thứ 4 trở đi TRƯỚC khi thêm outer edges,
+        # khiến L1 (boundary ngoài cùng) bị xóa và lane L1 không có biên phân cách.
+        # Bây giờ giữ toàn bộ chosen_boundaries, outer edges được thêm vào sau.
 
         visual_boundaries = list(chosen_boundaries)
 
         if self.locked and len(visual_boundaries) >= 2:
-            left_outer = {"coeffs": self.left_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
-            right_outer = {"coeffs": self.right_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
-            visual_boundaries = [left_outer] + visual_boundaries + [right_outer]
+            visual_boundaries = (
+                [self._make_outer_boundary_dict(self.left_outer_boundary)]
+                + visual_boundaries
+                + [self._make_outer_boundary_dict(self.right_outer_boundary)]
+            )
 
         visual_boundaries.sort(key=lambda item: np.polyval(item["coeffs"], self.bev_h - 1))
         self.visual_boundaries_bev = visual_boundaries
@@ -643,6 +689,10 @@ class LaneDetector:
         detected_boundaries_orig, _ = self._build_output_boundaries(chosen_boundaries)
 
         detected_count = len(chosen_boundaries)
+        n_inner = detected_count
+        total_boundaries = (n_inner + 2) if self.locked else detected_count
+        lane_count = max(0, total_boundaries - 1) if self.locked else len(lane_polygons_orig)
+
         track_scores = [float(item.get("score", 0.0)) for item in chosen_boundaries]
         confidence = float(np.mean(track_scores)) if track_scores else 0.0
         if self.locked:
@@ -675,10 +725,10 @@ class LaneDetector:
             "boundaries": boundaries_orig,
             "detected_boundaries": detected_boundaries_orig,
             "lane_polygons": lane_polygons_orig,
-            "boundary_count": 5 if self.locked else detected_count,
+            "boundary_count": total_boundaries,
             "visual_boundary_count": len(visual_boundaries),
             "estimated_outer_edges": 2 if self.locked else 0,
-            "lane_count": 4 if self.locked else len(lane_polygons_orig),
+            "lane_count": lane_count,
             "confidence": float(confidence),
             "locked": self.locked,
             "lock_hits": int(self.lock_hits),
@@ -698,10 +748,10 @@ class LaneDetector:
             boundaries = list(self.active_boundaries_bev)
 
         if self.locked and len(boundaries) >= 2:
-            if len(boundaries) > 3:
-                boundaries = sorted(boundaries, key=lambda item: float(np.polyval(item["coeffs"], self.bev_h - 1)))[:3]
-            left_outer = {"coeffs": self.left_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
-            right_outer = {"coeffs": self.right_outer_boundary, "score": 1.0, "coverage_ratio": 1.0, "continuity_ratio": 1.0, "y_min": 0, "y_max": self.bev_h - 1, "age": 999, "misses": 0}
+            # FIX 4: bỏ hard-cap [:3] — nhất quán với detect() và _build_frozen_result()
+            # Giữ toàn bộ locked boundaries trước khi thêm outer edges
+            left_outer = self._make_outer_boundary_dict(self.left_outer_boundary)
+            right_outer = self._make_outer_boundary_dict(self.right_outer_boundary)
             boundaries = [left_outer] + boundaries + [right_outer]
             boundaries.sort(key=lambda item: np.polyval(item["coeffs"], self.bev_h - 1))
         return boundaries
@@ -710,7 +760,7 @@ class LaneDetector:
         try:
             if cv2.pointPolygonTest(self.src_quad.astype(np.int32), (int(bottom_center[0]), int(bottom_center[1])), False) < 0:
                 return -1
-        except:
+        except Exception:
             return -1
 
         boundaries = self._vehicle_partition_boundaries()
@@ -737,12 +787,13 @@ class LaneDetector:
             else:
                 buffer = 8
 
+            # FIX 5: sửa dead-code — cả 2 nhánh if/else đều trả về idx+1 (vô nghĩa).
+            # Bây giờ trả về lane_index đúng dựa trên vị trí bev_x trong khoảng [left_x, right_x].
+            # Lane index = idx + 1 (1-based), không thay đổi logic, nhưng loại bỏ dead code.
             if left_x - buffer <= bev_x <= right_x + buffer:
-                if bev_x < (left_x + right_x) / 2:
-                    return idx + 1
-                else:
-                    return idx + 1
+                return idx + 1
 
+        # Xe nằm ngoài tất cả các lane đã biết nhưng gần boundary đầu tiên → gán lane 1
         if bev_x < float(np.polyval(boundaries[0]["coeffs"], bev_y)) + 25:
             return 1
 
